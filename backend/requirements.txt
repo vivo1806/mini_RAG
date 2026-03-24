@@ -1,0 +1,7 @@
+faiss-cpu
+openai
+python-dotenv
+requests
+numpy
+fastapi
+uvicorn[standard]
