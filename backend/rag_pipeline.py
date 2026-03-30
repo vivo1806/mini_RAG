@@ -1,15 +1,4 @@
-"""
-Mini-RAG Pipeline
-=================
-A simple Retrieval-Augmented Generation pipeline that:
-  1. Loads and chunks markdown documents
-  2. Generates embeddings via OpenRouter API
-  3. Builds a FAISS vector index for semantic search
-  4. Retrieves top-k relevant chunks for a user query
-  5. Generates grounded answers using a local Ollama LLM
 
-Dependencies: faiss-cpu, openai, python-dotenv, requests, numpy
-"""
 
 import os
 import sys
@@ -23,18 +12,24 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────
+
 
 load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# Choose between "ollama" or "api"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
+
+# Ollama configuration
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+
+# API configuration
+API_LLM_MODEL = os.getenv("API_LLM_MODEL", "meta-llama/llama-3-8b-instruct")
 EMBEDDING_MODEL = "openai/text-embedding-3-small"
 
-# Document paths (relative to this script)
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCUMENT_PATHS = [
     os.path.join(SCRIPT_DIR, "doc1.md"),
@@ -42,23 +37,16 @@ DOCUMENT_PATHS = [
     os.path.join(SCRIPT_DIR, "doc3.md"),
 ]
 
-# Chunking parameters
+
 CHUNK_SIZE = 500       # characters per chunk
 CHUNK_OVERLAP = 50     # overlap between consecutive chunks
 TOP_K = 3              # number of chunks to retrieve
 
 
-# ──────────────────────────────────────────────
-# Step 1: Document Loading
-# ──────────────────────────────────────────────
+
 
 def load_documents(paths: list[str]) -> list[dict]:
-    """
-    Load markdown files from disk.
-
-    Returns:
-        List of dicts with keys: 'filename', 'content'
-    """
+    
     documents = []
     for path in paths:
         if not os.path.exists(path):
@@ -72,15 +60,9 @@ def load_documents(paths: list[str]) -> list[dict]:
     return documents
 
 
-# ──────────────────────────────────────────────
-# Step 2: Document Chunking
-# ──────────────────────────────────────────────
 
 def chunk_document(doc: dict, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[dict]:
-    """
-    Split a document into overlapping chunks of approximately `chunk_size` characters.
-    Each chunk retains metadata about its source document and position.
-    """
+    
     text = doc["content"]
     filename = doc["filename"]
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
@@ -124,9 +106,7 @@ def chunk_all_documents(documents: list[dict]) -> list[dict]:
     return all_chunks
 
 
-# ──────────────────────────────────────────────
-# Step 3: Embedding Generation (OpenRouter)
-# ──────────────────────────────────────────────
+
 
 def get_openrouter_client() -> OpenAI:
     """Create an OpenAI-compatible client pointed at OpenRouter."""
@@ -149,9 +129,7 @@ def generate_embeddings(texts: list[str], client: OpenAI) -> np.ndarray:
     return np.array(embeddings, dtype="float32")
 
 
-# ──────────────────────────────────────────────
-# Step 4: FAISS Vector Index
-# ──────────────────────────────────────────────
+
 
 def build_faiss_index(chunks: list[dict], client: OpenAI) -> tuple[faiss.IndexFlatL2, np.ndarray]:
     """Build a FAISS flat L2 index over the document chunk embeddings."""
@@ -169,9 +147,7 @@ def build_faiss_index(chunks: list[dict], client: OpenAI) -> tuple[faiss.IndexFl
     return index, embeddings
 
 
-# ──────────────────────────────────────────────
-# Step 5: Semantic Retrieval
-# ──────────────────────────────────────────────
+
 
 def retrieve_relevant_chunks(
     query: str,
@@ -196,12 +172,10 @@ def retrieve_relevant_chunks(
     return results
 
 
-# ──────────────────────────────────────────────
-# Step 6: Answer Generation (Ollama LLM)
-# ──────────────────────────────────────────────
 
-def generate_answer(query: str, retrieved_chunks: list[dict]) -> str:
-    """Generate an answer using a local Ollama LLM, grounded in retrieved context."""
+
+def generate_answer(query: str, retrieved_chunks: list[dict], client: OpenAI = None) -> str:
+    """Generate an answer using a local Ollama LLM or API, grounded in retrieved context."""
     context_block = ""
     for chunk in retrieved_chunks:
         context_block += f"\n--- Source: {chunk['source']} (Chunk #{chunk['chunk_id']}) ---\n"
@@ -223,41 +197,54 @@ Question: {query}
 
 Answer (based strictly on the above context):"""
 
-    url = f"{OLLAMA_BASE_URL}/api/generate"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": user_prompt,
-        "system": system_prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.3,
-            "num_predict": 512,
-        },
-    }
+    if LLM_PROVIDER == "api":
+        if not client:
+            client = get_openrouter_client()
+        try:
+            api_response = client.chat.completions.create(
+                model=API_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=512,
+            )
+            return api_response.choices[0].message.content
+        except Exception as e:
+            raise RuntimeError(f"Error calling LLM API: {e}")
 
-    try:
-        response = requests.post(url, json=payload, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        return result.get("response", "Error: No response generated.")
-    except requests.exceptions.ConnectionError:
-        raise ConnectionError(
-            f"Could not connect to Ollama at {OLLAMA_BASE_URL}. "
-            f"Make sure Ollama is running: `ollama serve`"
-        )
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Error calling Ollama: {e}")
+    else:
+        url = f"{OLLAMA_BASE_URL}/api/generate"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": user_prompt,
+            "system": system_prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": 512,
+            },
+        }
+
+        try:
+            response = requests.post(url, json=payload, timeout=120)
+            response.raise_for_status()
+            result = response.json()
+            return result.get("response", "Error: No response generated.")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(
+                f"Could not connect to Ollama at {OLLAMA_BASE_URL}. "
+                f"Make sure Ollama is running: `ollama serve`"
+            )
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Error calling Ollama: {e}")
 
 
-# ──────────────────────────────────────────────
-# RAGPipeline Class (for API integration)
-# ──────────────────────────────────────────────
+
 
 class RAGPipeline:
-    """
-    Encapsulates the RAG pipeline for use by the FastAPI backend.
-    Call initialize() once at startup, then get_response() per query.
-    """
+    
 
     def __init__(self):
         self.client = None
@@ -266,7 +253,7 @@ class RAGPipeline:
         self.is_ready = False
 
     def initialize(self):
-        """Load documents, build chunks, generate embeddings, and build FAISS index."""
+        
         logger.info("Initializing RAG pipeline...")
 
         documents = load_documents(DOCUMENT_PATHS)
@@ -285,12 +272,7 @@ class RAGPipeline:
         logger.info("RAG pipeline initialized and ready.")
 
     def get_response(self, query: str) -> dict:
-        """
-        Process a user query through the full RAG pipeline.
-
-        Returns:
-            dict with keys: 'answer' (str), 'sources' (list of source info dicts)
-        """
+        
         if not self.is_ready:
             raise RuntimeError("Pipeline not initialized. Call initialize() first.")
 
@@ -302,7 +284,7 @@ class RAGPipeline:
         )
 
         # Generate answer
-        answer = generate_answer(query, retrieved)
+        answer = generate_answer(query, retrieved, client=self.client)
 
         # Build source info
         sources = [
